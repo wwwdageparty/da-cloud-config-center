@@ -5,32 +5,31 @@
   ==========================================================
    A lightweight Cloudflare Workers microservice for
    distributed configuration storage, version control,
-   and secure secret indirection.
+   and environment-based secret indirection.
 
   ✅ Overview
   ----------------------------------------------------------
-  • Key–value config store per service/instance/key
+  • Key–value config store per service / instance / key
   • Hierarchical fallback lookup (service → global)
   • Lightweight REST API for CRUD operations
   • System-reserved table for version & metadata
-  • Optional KV-based secret indirection (DASECRET_*)
+  • Secrets resolved directly from environment (DASECRET_*)
   • Consistent schema across all DaSystem modules
 
   🔒 Security & Access
   ----------------------------------------------------------
   • Read operations require DA_READTOKEN
   • Write & system init require DA_WRITETOKEN
-  • Secrets must use prefix "DASECRET_" and are resolved
-    via /secret endpoint with read authorization only
-  • Secret values are never stored in plaintext in DB;
-    only the secret name is referenced
+  • Secret names must start with "DASECRET_"
+  • /secret endpoint reads from environment bindings only
+  • No KV or D1 storage is used for secret values
 
   ⚙️ Environment Bindings
   ----------------------------------------------------------
   DB              → Cloudflare D1 database binding
-  SECRETS_KV      → (optional) KV namespace for secrets
   DA_WRITETOKEN   → Required for write & /systeminit
   DA_READTOKEN    → Required for read /secret /config
+  DASECRET_*      → Optional secret values (env-based)
 
   🧱 Tables
   ----------------------------------------------------------
@@ -44,40 +43,54 @@
   PUT    /config                           → set/update config
   DELETE /config?service=&instance=&key=   → delete config
   GET    /configs?service=&instance=       → list configs
-  GET    /secret?name=DASECRET_xxx         → resolve secret value
+  GET    /secret?name=DASECRET_xxx         → resolve env secret value
 */
 
 
+
 /////////////////////////   Worker Entry   /////////////////////////
+
 export default {
   async fetch(request, env) {
+    // --- Handle CORS preflight ---
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        },
+      });
+    }
+
     const { pathname } = new URL(request.url);
     G_DB = env.DB;
     G_ENV = env;
+    let response = new Response("Not found", { status: 404 });
 
     // System init
     if (pathname === "/systeminit" && request.method === "POST") {
-      return await systemInit(request);
+      response = await systemInit(request);
     }
 
     // Config CRUD endpoints
     if (pathname === "/config" && request.method === "GET") {
-      return await handleGetConfig(request);
+      response = await handleGetConfig(request);
     }
     if (pathname === "/secret" && request.method === "GET") {
-      return await handleGetSecret(request);
+      response = await handleGetSecret(request);
     }
     if (pathname === "/config" && request.method === "PUT") {
-      return await putConfig(request);
+      response = await putConfig(request);
     }
     if (pathname === "/config" && request.method === "DELETE") {
-      return await deleteConfig(request);
+      response = await deleteConfig(request);
     }
     if (pathname === "/configs" && request.method === "GET") {
-      return await listConfigs(request);
+      response = await listConfigs(request);
     }
 
-    return new Response("Not found", { status: 404 });
+    return withCors(response);
   },
 };
 
@@ -124,6 +137,7 @@ async function handleGetConfig(request) {
   }), { headers: { "Content-Type": "application/json" } });
 }
 
+
 async function handleGetSecret(request) {
   const unauthorized = checkAuthorizationRead(request);
   if (unauthorized) return unauthorized;
@@ -134,11 +148,9 @@ async function handleGetSecret(request) {
   if (!name.startsWith(C_SECRET_PREFIX)) {
     return jsonError("Invalid secret name", 400);
   }
+  
   let realValue = G_ENV[name];
-  if (!realValue && G_ENV.SECRETS_KV) {
-    realValue = await G_ENV.SECRETS_KV.get(name);
-  }
-  if (!realValue) return jsonError("Secret not found", 404);
+  if (!realValue) return jsonError(`Secret not found: ${name}`, 404);
   return jsonSuccess({ value: realValue });
 }
 
@@ -218,29 +230,11 @@ async function listConfigs(request) {
 
   service = service ?? "";
   instance = instance ?? "";
-
   try {
-    let sql = `SELECT c1 AS service, c2 AS instance, c3 AS key, t1 AS value, v1 AS created_at FROM configs`;
-    const filters = [];
-    const values = [];
+    let sql = `SELECT c1 AS service, c2 AS instance, c3 AS key, t1 AS value, v1 AS created_at FROM configs`
+      + ` where c1=? and c2=? order by c1, c2, c3`;
 
-    // Add WHERE conditions dynamically
-    if (service !== "") {
-      filters.push("c1 = ?");
-      values.push(service);
-    }
-    if (instance !== "") {
-      filters.push("c2 = ?");
-      values.push(instance);
-    }
-
-    if (filters.length > 0) {
-      sql += " WHERE " + filters.join(" AND ");
-    }
-
-    sql += " ORDER BY c1, c2, c3";
-
-    const result = await G_DB.prepare(sql).bind(...values).all();
+    const result = await G_DB.prepare(sql).bind(service, instance).all();
     const configs = result.results || [];
 
     return jsonSuccess({
@@ -398,6 +392,17 @@ function jsonError(msg, code = 400) {
 function jsonSuccess(data) {
   return new Response(JSON.stringify({ success: true, ...data }), {
     headers: { "Content-Type": "application/json" },
+  });
+}
+
+function withCors(response) {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  return new Response(response.body, {
+    status: response.status,
+    headers,
   });
 }
 
